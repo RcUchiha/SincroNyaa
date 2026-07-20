@@ -6,6 +6,7 @@ import sys
 import os
 import subprocess
 import tempfile
+import bisect
 from pathlib import Path
 import json
 
@@ -59,6 +60,29 @@ def extract_audio(video_path: str, wav_path: str):
         "-ac", "1", "-ar", str(SAMPLE_RATE), "-vn", wav_path
     ]
     subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+
+
+def get_video_fps(video_path: str) -> tuple[int, int]:
+    """
+    Devuelve el framerate del video como fracción entera (num, den).
+    Ej: 23.976fps -> (24000, 1001), 24fps -> (24, 1)
+    """
+    cmd = [
+        "ffprobe",
+        "-v", "quiet",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=r_frame_rate",
+        "-of", "json",
+        video_path,
+    ]
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    try:
+        data = json.loads(result.stdout)
+        rate = data["streams"][0]["r_frame_rate"]
+        num, den = (int(x) for x in rate.split("/"))
+        return num, den
+    except Exception:
+        return 24000, 1001
 
 
 def extract_keyframes(video_path: str) -> list[int]:
@@ -282,7 +306,6 @@ def nearest_keyframe(t_ms: int, keyframes_ms: list[int]) -> int | None:
     """
     if not keyframes_ms:
         return None
-    import bisect
     idx = bisect.bisect_left(keyframes_ms, t_ms)
     candidates = []
     if idx < len(keyframes_ms):
@@ -305,22 +328,22 @@ def _ms_to_ass_time(ms: int) -> str:
     return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
 
 
-def _prev_frame_ms(kf_ms: int, frame_timestamps_new: list[int]) -> int:
+def _prev_frame_ms(kf_ms: int, frame_timestamps_new: list[int], fallback_frame_ms: int = 42) -> int:
     """
     Devuelve el timestamp del frame inmediatamente anterior al frame del keyframe.
     Si frame_timestamps_new no esta disponible (lista vacia), aproxima restando
-    un frame a 23.976fps (~42ms).
+    fallback_frame_ms (duracion de un frame al fps real del video nuevo si se
+    pudo determinar, o ~42ms/23.976fps por defecto).
     """
     if not frame_timestamps_new:
-        return max(0, kf_ms - 42)
-    import bisect
+        return max(0, kf_ms - fallback_frame_ms)
     idx = bisect.bisect_left(frame_timestamps_new, kf_ms)
     if idx > 0:
         return frame_timestamps_new[idx - 1]
-    return max(0, kf_ms - 42)
+    return max(0, kf_ms - fallback_frame_ms)
 
 
-def _ass_round_for_end(kf_ms: int, frame_timestamps_new: list[int]) -> int:
+def _ass_round_for_end(kf_ms: int, frame_timestamps_new: list[int], fallback_frame_ms: int = 42) -> int:
     """
     Para snap de END: queremos que en Aegisub la linea termine en el frame
     inmediatamente anterior al frame del keyframe. ASS guarda timestamps en
@@ -331,7 +354,7 @@ def _ass_round_for_end(kf_ms: int, frame_timestamps_new: list[int]) -> int:
     final, el end debe ser >= T_prev. Usamos ceil a centesimas para garantizar
     eso despues del truncado del ASS.
     """
-    prev_ms = _prev_frame_ms(kf_ms, frame_timestamps_new)
+    prev_ms = _prev_frame_ms(kf_ms, frame_timestamps_new, fallback_frame_ms)
     # ceil a centesimas: redondea hacia arriba al multiplo de 10 mas cercano
     return -(-prev_ms // 10) * 10
 
@@ -351,6 +374,7 @@ def snap_to_keyframes(
     keyframes_new_ms: list[int],
     frame_timestamps_new: list[int] | None = None,
     threshold_ms: int = KEYFRAME_SNAP_MS,
+    fallback_frame_ms: int = 42,
 ) -> tuple[int, int, list[str]]:
     """
     Para cada línea ya desplazada por el offset de audio:
@@ -371,7 +395,7 @@ def snap_to_keyframes(
     mantiene la línea sin vacío intermedio.
 
     Si frame_timestamps_new no se pasa, el frame anterior se aproxima restando
-    ~42ms (un frame a 23.976fps).
+    fallback_frame_ms (por defecto ~42ms, un frame a 23.976fps).
 
     Retorna (n_starts_snapped, n_ends_snapped, detalles_por_linea) para el log.
     """
@@ -470,7 +494,7 @@ def snap_to_keyframes(
                     # el mismo valor que tendría un start (timestamp del keyframe).
                     line.end = _ass_round_for_start(near_new)
                 else:
-                    line.end = _ass_round_for_end(near_new, frame_timestamps_new)
+                    line.end = _ass_round_for_end(near_new, frame_timestamps_new, fallback_frame_ms)
                 snapped_ends += 1
                 end_snapped = True
                 if dbg:
@@ -718,6 +742,48 @@ class SyncWorker(QThread):
     def cancel(self):
         self._cancelled = True
 
+    def _resolver_keyframes(
+        self,
+        video_path: str,
+        kf_path: str,
+        etiqueta: str,
+        progreso_carga: int,
+        progreso_lectura: int,
+    ) -> tuple[list[int], list[int]]:
+        """
+        Resuelve los keyframes (ms) de un video: si `kf_path` viene cargado,
+        parsea el archivo y convierte sus numeros de frame a ms usando
+        timestamps reales de VapourSynth, cayendo a deteccion automatica por
+        ffprobe si VapourSynth falla. Si no hay `kf_path`, extrae los
+        keyframes automaticamente por ffprobe directamente.
+
+        `etiqueta` ("antiguo"/"nuevo") solo se usa para los mensajes de log.
+        `progreso_carga`/`progreso_lectura` son los valores de progreso a
+        emitir en cada paso, iguales a los que usaba el bloque original.
+
+        Devuelve (keyframes_ms, frame_timestamps_ms); frame_timestamps_ms
+        queda vacio salvo que se haya usado VapourSynth con exito.
+        """
+        if kf_path:
+            self.log.emit(f"🔑 Cargando keyframes del video {etiqueta} (archivo)...")
+            self.progress.emit(progreso_carga)
+            kf_frames = parse_keyframe_frames(kf_path)
+            self.log.emit(f"🔑 Leyendo timestamps del video {etiqueta} (VapourSynth)...")
+            self.progress.emit(progreso_lectura)
+            try:
+                ts = build_frame_timestamps(video_path)
+                kf_ms = keyframe_frames_to_ms(kf_frames, ts)
+                self.log.emit(f"   ↳ {len(kf_ms)} keyframes cargados (timestamps reales)")
+                return kf_ms, ts
+            except Exception as e:
+                self.log.emit(f"   ⚠ VapourSynth fallo: {e}")
+                self.log.emit("   ↳ Cayendo a deteccion automatica con ffprobe.")
+                return extract_keyframes(video_path), []
+        else:
+            self.log.emit(f"🔑 Extrayendo keyframes del video {etiqueta}...")
+            self.progress.emit(progreso_lectura)
+            return extract_keyframes(video_path), []
+
     def run(self):
         try:
             with tempfile.TemporaryDirectory() as tmp:
@@ -784,52 +850,27 @@ class SyncWorker(QThread):
                 if self._cancelled: return
 
                 # ── Keyframes: cargar o extraer ──────────────────────────
-                if self.kf_old_path:
-                    self.log.emit("🔑 Cargando keyframes del video antiguo (archivo)...")
-                    self.progress.emit(80)
-                    kf_frames_old = parse_keyframe_frames(self.kf_old_path)
-                    self.log.emit("🔑 Leyendo timestamps del video antiguo (VapourSynth)...")
-                    self.progress.emit(83)
-                    try:
-                        ts_old = build_frame_timestamps(self.old_video)
-                        kf_old = keyframe_frames_to_ms(kf_frames_old, ts_old)
-                        self.log.emit(f"   ↳ {len(kf_old)} keyframes cargados (timestamps reales)")
-                    except Exception as e:
-                        self.log.emit(f"   ⚠ VapourSynth fallo: {e}")
-                        self.log.emit("   ↳ Cayendo a deteccion automatica con ffprobe.")
-                        kf_old = extract_keyframes(self.old_video)
-                else:
-                    self.log.emit("🔑 Extrayendo keyframes del video antiguo...")
-                    self.progress.emit(83)
-                    kf_old = extract_keyframes(self.old_video)
-
-                ts_new: list[int] = []   # timestamps de todos los frames del video nuevo
-                if self.kf_new_path:
-                    self.log.emit("🔑 Cargando keyframes del video nuevo (archivo)...")
-                    self.progress.emit(87)
-                    kf_frames_new = parse_keyframe_frames(self.kf_new_path)
-                    self.log.emit("🔑 Leyendo timestamps del video nuevo (VapourSynth)...")
-                    self.progress.emit(90)
-                    try:
-                        ts_new = build_frame_timestamps(self.new_video)
-                        kf_new = keyframe_frames_to_ms(kf_frames_new, ts_new)
-                        self.log.emit(f"   ↳ {len(kf_new)} keyframes cargados (timestamps reales)")
-                    except Exception as e:
-                        self.log.emit(f"   ⚠ VapourSynth fallo: {e}")
-                        self.log.emit("   ↳ Cayendo a deteccion automatica con ffprobe.")
-                        kf_new = extract_keyframes(self.new_video)
-                else:
-                    self.log.emit("🔑 Extrayendo keyframes del video nuevo...")
-                    self.progress.emit(90)
-                    kf_new = extract_keyframes(self.new_video)
+                kf_old, _ts_old = self._resolver_keyframes(
+                    self.old_video, self.kf_old_path, "antiguo", 80, 83
+                )
+                kf_new, ts_new = self._resolver_keyframes(
+                    self.new_video, self.kf_new_path, "nuevo", 87, 90
+                )
 
                 if kf_old and kf_new:
                     self.log.emit(
                         f"   ↳ Keyframes: {len(kf_old)} (antiguo) / {len(kf_new)} (nuevo)"
                     )
                     self.log.emit(f"   ↳ Umbral de snap: ±{KEYFRAME_SNAP_MS}ms")
+                    fallback_frame_ms = 42
+                    if not ts_new:
+                        fps_num, fps_den = get_video_fps(self.new_video)
+                        if fps_num > 0:
+                            fallback_frame_ms = round(1000 * fps_den / fps_num)
                     n_starts, n_ends, snap_details = snap_to_keyframes(
-                        subs, kf_old, kf_new, frame_timestamps_new=ts_new
+                        subs, kf_old, kf_new,
+                        frame_timestamps_new=ts_new,
+                        fallback_frame_ms=fallback_frame_ms,
                     )
                     self.log.emit(
                         f"   ↳ Snap aplicado — starts: {n_starts} · ends: {n_ends}"
