@@ -59,7 +59,13 @@ def extract_audio(video_path: str, wav_path: str):
         "ffmpeg", "-y", "-i", video_path,
         "-ac", "1", "-ar", str(SAMPLE_RATE), "-vn", wav_path
     ]
-    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+    result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    if result.returncode != 0:
+        stderr_tail = "\n".join(result.stderr.strip().splitlines()[-8:]) or "(sin salida de stderr)"
+        raise RuntimeError(
+            f"ffmpeg fallo al extraer audio de {video_path} "
+            f"(codigo {result.returncode}):\n{stderr_tail}"
+        )
 
 
 def get_video_fps(video_path: str) -> tuple[int, int]:
@@ -1303,6 +1309,31 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(
                 self, "Faltan archivos",
                 "Debes seleccionar todos los archivos antes de continuar."
+            )
+            return
+
+        if not Path(old).is_file():
+            QMessageBox.warning(
+                self, "Archivo inválido",
+                f"El video antiguo no es un archivo válido:\n{old}"
+            )
+            return
+        if not Path(new).is_file():
+            QMessageBox.warning(
+                self, "Archivo inválido",
+                f"El video nuevo no es un archivo válido:\n{new}"
+            )
+            return
+        if not Path(subs).is_file():
+            QMessageBox.warning(
+                self, "Archivo inválido",
+                f"El subtítulo original no es un archivo válido:\n{subs}"
+            )
+            return
+        if not Path(out).parent.is_dir():
+            QMessageBox.warning(
+                self, "Ruta de salida inválida",
+                f"El directorio de salida no existe:\n{Path(out).parent}"
             )
             return
 
