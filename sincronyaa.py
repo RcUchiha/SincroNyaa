@@ -255,7 +255,19 @@ def build_frame_timestamps(video_path: str) -> list[int]:
     ejecuta en un subproceso Python aislado y los timestamps se reciben
     via stdout en formato JSON. Si el subproceso falla por cualquier razon,
     se lanza una excepcion con el mensaje correspondiente.
+
+    La primera vez que lsmas/ffms2 abren un video generan un archivo de
+    indice al lado (<video>.lwi para lsmas, <video>.ffindex para ffms2,
+    segun confirma la documentacion oficial de cada uno) para no reindexar
+    en corridas futuras. Este programa no se beneficia de ese cache entre
+    sesiones, asi que el indice generado en esta corrida se borra al
+    finalizar (exito o error). Si el indice ya existia de antes (por
+    ejemplo, de otro uso de VapourSynth fuera de este programa), se deja
+    intacto.
     """
+    posibles_indices = [f"{video_path}.lwi", f"{video_path}.ffindex"]
+    ya_existian = {p for p in posibles_indices if os.path.exists(p)}
+
     # Escribir el script auxiliar a un archivo temporal
     fd, script_path = tempfile.mkstemp(suffix="_vs_timestamps.py", text=True)
     try:
@@ -274,6 +286,12 @@ def build_frame_timestamps(video_path: str) -> list[int]:
             os.unlink(script_path)
         except OSError:
             pass
+        for p in posibles_indices:
+            if p not in ya_existian and os.path.exists(p):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
 
     if proc.returncode != 0:
         raise RuntimeError(
