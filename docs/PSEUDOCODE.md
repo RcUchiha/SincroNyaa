@@ -5,213 +5,315 @@
 ## 1. Seudocódigo clásico (estilo algoritmo)
 
 ```
-PROGRAMA SincroNyaa
+ALGORITMO SincronizarSubtitulo(video_antiguo, video_nuevo, subtitulo, salida, keyframes_antiguo=NULO, keyframes_nuevo=NULO)
 
-ENTRADA:
-  video_anterior  → archivo de video original
-  video_nuevo     → archivo de video nuevo
-  subtitulo       → archivo .ass / .srt original
-  salida          → ruta donde guardar el subtítulo sincronizado
+  // ── FASE 0: validación y arranque en la ventana principal ──────────
+  SI ffmpeg no está en el PATH ENTONCES
+    MOSTRAR error crítico "ffmpeg no encontrado" (al abrir la ventana)
+  FIN SI
 
-─────────────────────────────────────────
-FASE 1: EXTRACCIÓN DE AUDIO
-─────────────────────────────────────────
-audio_ant ← ffmpeg(video_anterior, mono, 16kHz)
-audio_nue ← ffmpeg(video_nuevo,    mono, 16kHz)
+  AL PRESIONAR "Sincronizar":
+    SI falta video_antiguo, video_nuevo, subtitulo o salida ENTONCES
+      MOSTRAR advertencia "Debes seleccionar todos los archivos" ; TERMINAR
+    FIN SI
+    SI video_antiguo, video_nuevo o subtitulo no son archivos válidos ENTONCES
+      MOSTRAR advertencia específica del campo inválido ; TERMINAR
+    FIN SI
+    SI la carpeta de salida no existe ENTONCES
+      MOSTRAR advertencia "El directorio de salida no existe" ; TERMINAR
+    FIN SI
+    INICIAR SyncWorker(...) EN HILO SEPARADO
+    // la ventana principal queda escuchando señales: progress, log, finished, error
 
-─────────────────────────────────────────
-FASE 2: ANÁLISIS DE CARACTERÍSTICAS
-─────────────────────────────────────────
-FUNCIÓN compute_features(audio):
-  mel    ← mel_spectrogram(audio)       // energía espectral
-  chroma ← chroma_stft(audio)           // información tonal
-  onset  ← onset_strength(audio)        // fuerza de ataques sonoros
 
-  mel    ← normalizar(mel)
-  chroma ← normalizar(chroma)
-  onset  ← normalizar(onset)
+  FUNCION SyncWorker.run()
+    cancelado ← FALSO   // flag cooperativo, ver notas de cancelación al final
 
-  // Pesos: onset y mel dominan (40% c/u), chroma apoya (20%)
-  RETORNAR mel * 0.4 + chroma * 0.2 + onset * 0.4
+    // ── FASE 1: extracción de audio ──────────────────────────────────
+    audio_ant ← ExtraerAudio(video_antiguo)   // ffmpeg → WAV mono 16kHz
+    SI cancelado ENTONCES DEVOLVER FIN SI
+    audio_nue ← ExtraerAudio(video_nuevo)
+    SI cancelado ENTONCES DEVOLVER FIN SI
+    // ExtraerAudio: si ffmpeg devuelve código de error, LANZAR excepción
+    // con las últimas 8 líneas de stderr (motivo real del fallo)
 
-feat_ant ← compute_features(audio_ant)
-feat_nue ← compute_features(audio_nue)
+    // ── FASE 2: características de audio ─────────────────────────────
+    feat_ant ← ComputeFeatures(audio_ant)
+    feat_nue ← ComputeFeatures(audio_nue)
+    SI cancelado ENTONCES DEVOLVER FIN SI
 
-─────────────────────────────────────────
-FASE 3: CORRELACIÓN CRUZADA FFT
-─────────────────────────────────────────
-FUNCIÓN find_offset(feat_ant, feat_nue):
-  corr ← fftconvolve(feat_nue, invertir(feat_ant))  // correlación cruzada
+    FUNCION ComputeFeatures(audio):
+      mel   ← normalizar(mel_spectrogram(audio))     // energía espectral
+      onset ← normalizar(onset_strength(audio))       // fuerza de ataques sonoros
+      // sin canal de chroma: aporta ruido en contenido hablado
+      DEVOLVER mel * 0.3 + onset * 0.7                // onset domina, es mas discriminativo
+    FIN FUNCION
 
-  candidatos ← []
-  PARA CADA pico en top_picos(corr):
-    SI distancia(pico, candidatos existentes) > 50 frames:
-      agregar pico a candidatos
-    SI len(candidatos) == 5: PARAR
+    // ── FASE 3: offset por ventanas deslizantes ──────────────────────
+    ventanas ← []
+    PARA CADA ventana de 30s (paso 10s) EN feat_ant HACER
+      region_busqueda ← feat_nue recortado a [ventana ± 300s]
+      SI region_busqueda es mas corta que la ventana ENTONCES CONTINUAR FIN SI
+      corr ← CorrelacionCruzadaFFT(region_busqueda, ventana)
+      offset ← lag_del_pico_de(corr) convertido a segundos
+      confianza ← pico_de(corr) / desviacion_estandar(corr)
+      AGREGAR (tiempo_ventana, offset, confianza) A ventanas
+    FIN PARA
 
-  // Convertir lags a segundos (hop=512, sr=16000)
-  RETORNAR [(lag * 512/16000, score) PARA CADA candidato]
+    // ── FASE 4: agrupar en segmentos ─────────────────────────────────
+    segmentos ← ClusterOffsets(ventanas)
 
-candidatos ← find_offset(feat_ant, feat_nue)
+    FUNCION ClusterOffsets(ventanas):
+      fiables ← [v EN ventanas SI v.confianza >= 3.0]
+      SI fiables está vacío ENTONCES
+        SI ventanas no está vacío ENTONCES
+          DEVOLVER [la ventana de mayor confianza, como único segmento degenerado]
+        SINO
+          DEVOLVER []   // ningún resultado en absoluto
+        FIN SI
+      FIN SI
 
-─────────────────────────────────────────
-FASE 4: DETECCIÓN DE ESCENAS
-─────────────────────────────────────────
-FUNCIÓN detect_scenes(video, umbral=0.35):
-  cortes ← ffmpeg select=gt(scene, umbral)
-  RETORNAR filtrar_cortes_cercanos(cortes, min_gap=1.0s)
+      segmento_actual ← primera ventana fiable
+      PARA CADA ventana EN fiables[1:] HACER
+        salto_offset    ← |ventana.offset - promedio_ponderado(segmento_actual)| > 1.0s
+        hueco_temporal  ← (ventana.tiempo - anterior.tiempo) > 20.0s   // señal de OP/ED
+        SI salto_offset O hueco_temporal ENTONCES
+          CERRAR segmento_actual (offset = promedio ponderado por confianza)
+          ABRIR nuevo segmento_actual CON ventana
+        SINO
+          ACUMULAR ventana EN segmento_actual
+        FIN SI
+      FIN PARA
+      CERRAR último segmento_actual
+      DEVOLVER lista_de_segmentos
+    FIN FUNCION
 
-escenas_ant ← detect_scenes(video_anterior)
-escenas_nue ← detect_scenes(video_nuevo)
+    SI segmentos está vacío ENTONCES
+      EMITIR error "No se encontraron segmentos fiables. Comprueba que los videos comparten contenido."
+      TERMINAR
+    FIN SI
 
-─────────────────────────────────────────
-FASE 5: VOTACIÓN DEL OFFSET FINAL
-─────────────────────────────────────────
-FUNCIÓN vote_offset(candidatos, escenas_ant, escenas_nue):
-  mejor_offset ← candidatos[0]
-  mejor_score  ← -∞
+    // ── FASE 5: aplicar offset por segmento al subtítulo ─────────────
+    subs ← Cargar(subtitulo)
+    fallback ← offset del primer segmento
+    PARA CADA linea EN subs HACER
+      offset ← offset del segmento cuyo rango [inicio-5s, fin+5s] contiene linea.inicio
+               SINO fallback
+      linea._inicio_original ← linea.inicio   // para el snap de FASE 7
+      linea._fin_original    ← linea.fin
+      linea.inicio ← linea.inicio + offset    // nunca negativo
+      linea.fin    ← linea.inicio + duracion_original
+    FIN PARA
+    SI cancelado ENTONCES DEVOLVER FIN SI
 
-  PARA CADA offset EN candidatos:
-    score ← 0
-    PARA CADA corte EN escenas_ant:
-      target   ← corte + offset
-      dist     ← min(|corte_nue - target| PARA corte_nue EN escenas_nue)
-      score    ← score - dist    // menor distancia = mejor alineación
-    SI score > mejor_score:
-      mejor_score  ← score
-      mejor_offset ← offset
+    // ── FASE 6: resolver keyframes de cada video ─────────────────────
+    (kf_ant, _)      ← ResolverKeyframes(video_antiguo, keyframes_antiguo)
+    (kf_nue, ts_nue) ← ResolverKeyframes(video_nuevo, keyframes_nuevo)
 
-  RETORNAR mejor_offset
+    FUNCION ResolverKeyframes(video, archivo_keyframes):
+      SI archivo_keyframes fue cargado ENTONCES
+        frames ← ParsearArchivoKeyframes(archivo_keyframes)
+        // detecta automáticamente formato Aegisub/wwxd/scxvid/vstools
+        // o XviD 2pass stats
+        INTENTAR
+          timestamps ← TimestampsRealesViaVapourSynth(video)   // ver FASE 6a
+          kf_ms ← [timestamps[f] PARA CADA f EN frames SI f es índice válido]
+          DEVOLVER (kf_ms, timestamps)
+        CAPTURAR error DE VapourSynth
+          MOSTRAR "VapourSynth falló: {error}. Cayendo a detección automática."
+          DEVOLVER (ExtraerKeyframesFfprobe(video), [])
+        FIN INTENTAR
+      SINO
+        DEVOLVER (ExtraerKeyframesFfprobe(video), [])
+      FIN SI
+    FIN FUNCION
 
-offset_final ← vote_offset(candidatos, escenas_ant, escenas_nue)
+    // (FASE 6a) TimestampsRealesViaVapourSynth: ejecuta un subproceso
+    // Python aislado (VapourSynth es inestable en un QThread secundario)
+    // que prueba el filtro lsmas (LWLibavSource) y si no está disponible
+    // o falla, prueba ffms2 (Source). Para cada frame intenta leer la
+    // propiedad _AbsoluteTime (soporta fps variable real, ej. tras IVTC);
+    // sin esa propiedad, cae a un cálculo CFR puro por fps_num/fps_den
+    // del clip; sin fps válido, aproxima a 23.976fps. Antes de invocar el
+    // subproceso, registra si ya existían los archivos de índice (.lwi
+    // para lsmas, .ffindex para ffms2) al lado del video; al terminar
+    // (éxito o error) borra solo los que se generaron en esta corrida.
 
-─────────────────────────────────────────
-FASE 6: APLICACIÓN AL SUBTÍTULO
-─────────────────────────────────────────
-FUNCIÓN apply(subtitulo, escenas_ant, escenas_nue, offset):
-  pares ← emparejar_escenas(escenas_ant, escenas_nue, offset)
+    // ── FASE 7: snap de start/end a keyframes ────────────────────────
+    SI kf_ant no está vacío Y kf_nue no está vacío ENTONCES
+      fallback_frame_ms ← 42   // ~23.976fps
+      SI ts_nue está vacío ENTONCES
+        (fps_num, fps_den) ← FpsRealDe(video_nuevo)   // ffprobe
+        SI fps_num > 0 ENTONCES fallback_frame_ms ← 1000 * fps_den / fps_num FIN SI
+      FIN SI
+      (n_starts, n_ends) ← SnapAKeyframes(subs, kf_ant, kf_nue, ts_nue, fallback_frame_ms)
+    SINO
+      MOSTRAR "Sin keyframes disponibles, snap omitido."
+    FIN SI
 
-  PARA CADA linea EN subtitulo:
-    new_start ← linea.start + offset
+    FUNCION SnapAKeyframes(subs, kf_ant, kf_nue, ts_nue, fallback_frame_ms):
+      umbral ← 170ms
 
-    // Ajuste suave por escena cercana
-    (corte_ant, corte_nue) ← par_mas_cercano(pares, linea.start)
-    dist ← |linea.start - corte_ant|
-    SI dist < 0.6s:
-      delta     ← corte_nue - (corte_ant + offset)
-      new_start ← new_start + delta * 0.5   // atracción parcial al corte
+      // pares pegados: end de una línea y start de otra ancladas al
+      // mismo keyframe viejo (convención de fansub para evitar
+      // parpadeo en cortes de escena) deben quedar pegadas también
+      // en el resultado
+      pegadas ← DetectarParesPegados(subs, kf_ant, umbral)
 
-    linea.start ← new_start
-    linea.end   ← new_start + duracion_original
+      PARA CADA linea EN subs HACER
+        SI linea._inicio_original estaba a <= umbral de un keyframe viejo ENTONCES
+          candidato ← keyframe mas cercano en kf_nue al linea.inicio ya desplazado
+          SI candidato a <= umbral ENTONCES
+            linea.inicio ← candidato (truncado a centésimas, floor)
+          FIN SI
+        FIN SI
+        SI linea._fin_original estaba a <= umbral de un keyframe viejo ENTONCES
+          candidato ← keyframe mas cercano en kf_nue al linea.fin ya desplazado
+          SI candidato a <= umbral ENTONCES
+            SI linea está en pegadas ENTONCES
+              linea.fin ← candidato (mismo valor que tendría un start)
+            SINO
+              // end es exclusivo en fansub: debe terminar antes del
+              // frame siguiente, por eso se ancla al frame ANTERIOR
+              // al keyframe (redondeado hacia arriba a centésimas)
+              frame_anterior ← FrameAnteriorA(candidato, ts_nue, fallback_frame_ms)
+              linea.fin ← frame_anterior (ceil a centésimas)
+            FIN SI
+          FIN SI
+        FIN SI
+      FIN PARA
+      DEVOLVER (cantidad_starts_ajustados, cantidad_ends_ajustados)
+    FIN FUNCION
 
-  GUARDAR subtitulo en salida
+    // ── FASE 8: metadatos del subtítulo ──────────────────────────────
+    subs.aegisub_project["Video File"] ← video_nuevo
+    subs.aegisub_project["Audio File"] ← video_nuevo
+    // se agregan aunque el .ass original no tuviera esos campos
 
-apply(subtitulo, escenas_ant, escenas_nue, offset_final)
-FIN
+    // ── FASE 9: guardar ────────────────────────────────────────────────
+    Guardar(subs, salida)
+    SI cancelado ENTONCES DEVOLVER FIN SI
+    EMITIR finished(salida)
+
+  FIN FUNCION
+
+
+  // ═══════════════════════════════════════════════════════════════════
+  // Ventana principal: recibe las señales de SyncWorker
+  // ═══════════════════════════════════════════════════════════════════
+  AL RECIBIR progress(valor):
+    ACTUALIZAR barra de progreso
+
+  AL RECIBIR log(mensaje):
+    AGREGAR mensaje al cuadro de log
+
+  AL RECIBIR finished(salida):
+    MOSTRAR "¡Listo! Subtítulo guardado en: {salida}"
+    REHABILITAR controles
+
+  AL RECIBIR error(mensaje_con_traceback):
+    AGREGAR mensaje al log
+    MOSTRAR error crítico (QMessageBox.critical) con el traceback completo
+    REHABILITAR controles
+
+  AL PRESIONAR "Cancelar":
+    cancelado ← VERDADERO
+    // cooperativo: el paso pesado en curso (ffmpeg, VapourSynth, cálculo
+    // de correlación) termina igual antes de que el flag se note, no hay
+    // interrupción instantánea
+    REHABILITAR controles
+
+FIN ALGORITMO
 ```
 
 ---
 
 ## 2. Lenguaje natural paso a paso
 
-**Paso 1 — Extraer audio**
-Se usa ffmpeg para extraer el audio de ambos videos como WAV mono a 16 kHz. Mono y 16 kHz son suficientes para el análisis y reducen el tiempo de procesamiento.
+**1. Antes de arrancar**, la ventana principal valida que los cuatro campos obligatorios (video viejo, video nuevo, subtítulo, salida) estén completos, que video viejo/nuevo/subtítulo sean archivos que realmente existen, y que la carpeta de destino de la salida exista — cualquier fallo muestra una advertencia específica de cuál campo está mal y no llega a arrancar el proceso. Si todo está bien, se lanza un `SyncWorker` en un hilo (`QThread`) separado, y la ventana principal se limita a escuchar sus señales (`progress`, `log`, `finished`, `error`).
 
-**Paso 2 — Calcular características de audio**
-Para cada audio se calculan tres descriptores:
-- *Mel-spectrogram*: cómo se distribuye la energía a lo largo del tiempo en distintas bandas de frecuencia.
-- *Chroma*: qué notas o tonos predominan en cada instante. Es robusto ante diferencias de calidad de audio entre versiones.
-- *Onset strength*: qué tan fuerte es cada "ataque" sonoro (inicio de diálogo, efecto de sonido, golpe). Es el descriptor más útil para detectar puntos de anclaje temporales.
+**2. Se extrae el audio de ambos videos** con ffmpeg, como WAV mono a 16kHz. Si ffmpeg devuelve un código de error, ya no se descarta el motivo (como en versiones anteriores): se captura el stderr y las últimas líneas se incluyen en el mensaje de error, para saber si el problema fue un códec no soportado, un archivo corrupto, etc.
 
-Los tres se normalizan y se combinan en un único vector ponderado, dando más peso a los descriptores más discriminativos.
+**3. Se calculan las características de cada audio** combinando dos descriptores: mel-spectrogram (energía espectral, peso 0.3) y onset strength (fuerza de los "ataques" sonoros — inicios de diálogo, efectos, golpes; peso 0.7, es el más discriminativo). El canal de chroma que existía en versiones anteriores fue eliminado: agregaba ruido en contenido hablado sin mejorar la detección de offset.
 
-**Paso 3 — Correlación cruzada FFT**
-Se compara el vector del audio anterior contra el del nuevo usando correlación cruzada por FFT. Esto produce una curva de similitud donde los picos indican posibles offsets. En lugar de quedarse solo con el mejor pico, se recogen los 5 mejores candidatos asegurando que estén suficientemente separados entre sí, para evitar que todos apunten al mismo lugar.
+**4. En vez de un único offset global**, se calcula un offset local cada 10 segundos usando ventanas de 30 segundos: para cada ventana del audio viejo, se busca su mejor coincidencia dentro de una región de ±300 segundos del audio nuevo (no en todo el audio, para acotar el costo), vía correlación cruzada FFT. Cada ventana obtiene además una confianza (el pico de correlación normalizado por la desviación estándar de la señal completa de correlación).
 
-**Paso 4 — Detectar cortes de escena**
-ffmpeg analiza ambos videos fotograma a fotograma y detecta los momentos donde la imagen cambia bruscamente. Se filtran los cortes demasiado seguidos para quedarse solo con los significativos.
+**5. Las ventanas con confianza suficiente (≥3.0) se agrupan en segmentos** de offset estable. Un segmento nuevo arranca cuando el offset salta más de 1 segundo respecto al promedio acumulado del segmento actual, o cuando hay un hueco temporal de más de 20 segundos entre ventanas consecutivas fiables — esto último es la señal típica de un OP/ED con offset distinto al resto del episodio, donde las ventanas de esa zona no llegan al umbral de confianza. El offset final de cada segmento es el promedio ponderado por confianza de las ventanas que lo componen.
 
-**Paso 5 — Votar el offset final**
-Cada uno de los 5 candidatos se prueba contra las escenas detectadas: se calcula qué tan bien alinea los cortes del video anterior con los del nuevo. El candidato que produce la mejor alineación visual gana. Esto actúa como segunda opinión sobre el análisis de audio.
+**6. Si ninguna ventana alcanza el umbral de confianza**, se usa igual la de mayor confianza disponible como único segmento (mejor esfuerzo, degradado pero no vacío); si no hubo ninguna ventana en absoluto (por ejemplo, audio demasiado corto), el proceso termina con un error explícito pidiendo comprobar que los videos comparten contenido.
 
-**Paso 6 — Aplicar el offset al subtítulo**
-Cada línea del subtítulo se desplaza por el offset final. Adicionalmente, si una línea está cerca de un corte de escena, recibe un pequeño ajuste extra que la "atrae" hacia ese corte, mejorando la precisión justo en los momentos de cambio de escena donde el timing es más crítico.
+**7. Cada línea del subtítulo recibe el offset del segmento** cuyo rango cubre su tiempo de inicio (con un margen de ±5 segundos en los bordes, para tolerar imprecisiones del clustering); si ninguno la cubre, se usa el offset del primer segmento como respaldo. Antes de aplicar el offset, se guarda el tiempo original de cada línea (pre-offset) — lo va a necesitar el paso de snap a keyframes más adelante.
+
+**8. Se resuelven los keyframes de cada video** (el mismo proceso corre una vez para el video viejo y otra para el nuevo). Si el usuario cargó un archivo de keyframes para ese video, se parsea (soporta el formato estándar de Aegisub/wwxd/scxvid/vstools y el de estadísticas XviD 2-pass) y se intenta obtener los timestamps reales de cada frame del video vía VapourSynth.
+
+**9. VapourSynth corre en un subproceso Python aislado**, no dentro del hilo del worker, porque es inestable si se lo llama desde un `QThread` secundario (puede matar el proceso sin avisar). El subproceso prueba primero el filtro `lsmas`, y si no está disponible o falla, prueba `ffms2`; para cada frame intenta leer su timestamp real (soporta fps variable, por ejemplo tras IVTC), con dos niveles de respaldo si esa información no está disponible. Si VapourSynth tiene éxito, los números de frame del archivo de keyframes se convierten a milisegundos reales con esa tabla. Si falla por cualquier motivo, se cae a la detección automática por ffprobe para ese video — sin timestamps reales de frame.
+
+**10. La primera vez que lsmas o ffms2 abren un video generan un archivo de índice al lado** (`.lwi` o `.ffindex`) para no reindexar en corridas futuras — como este programa no vuelve a necesitar ese video en la misma sesión, el índice generado en esta corrida se borra al terminar (haya éxito o error). Si el índice ya existía de antes (por ejemplo, de otro uso de VapourSynth fuera de este programa), se deja intacto.
+
+**11. Si el usuario no cargó un archivo de keyframes para un video**, se extraen automáticamente vía ffprobe (buscando frames marcados como tipo I), sin pasar por VapourSynth en absoluto.
+
+**12. Si ambos videos (viejo y nuevo) terminaron con al menos un keyframe**, se hace el snap: para cada línea cuyo start y/o end *original* (antes del offset) estaba a 170ms o menos de un keyframe del video viejo, se busca el keyframe más cercano en el video nuevo al tiempo ya desplazado, y si también cae dentro del umbral, el tiempo se ancla a ese keyframe. El start se ancla directamente al keyframe; el end, siguiendo la convención de fansub de que el end es exclusivo, se ancla al frame inmediatamente *anterior* al keyframe (para que la línea termine antes de que arranque la escena nueva).
+
+**13. Si el end de una línea y el start de otra estaban anclados al mismo keyframe del video viejo** (convención común para evitar parpadeo en cortes de escena), ambos quedan con el mismo valor en el video nuevo, sin dejar un hueco intermedio entre las dos líneas.
+
+**14. Cuando no hay timestamps reales de frame del video nuevo** (porque no se cargó archivo de keyframes, o porque VapourSynth falló), el cálculo del "frame anterior" para el end usa un valor aproximado: la duración de un frame al fps real del video nuevo (consultado vía ffprobe), o ~42ms (23.976fps) si ni siquiera eso se pudo determinar.
+
+**15. Si alguno de los dos videos no produjo ningún keyframe**, el snap se omite por completo y el subtítulo queda solo con el offset por segmento aplicado.
+
+**16. Antes de guardar**, se actualizan los campos `Video File` y `Audio File` del subtítulo para que apunten al video nuevo — se agregan aunque el `.ass` original no tuviera esa sección, para que abrirlo en Aegisub cargue automáticamente el video correcto sin tener que hacerlo a mano.
+
+**17. El subtítulo se guarda en la ruta de salida** y se muestra un mensaje de éxito. En cualquier punto del proceso, cancelar es cooperativo: se revisa un flag entre pasos, no corta un paso pesado (extracción de audio, VapourSynth, cálculo de correlación) a mitad de camino — el paso en curso termina igual antes de que se note la cancelación. Cualquier excepción no capturada en el flujo entero se atrapa una sola vez, al nivel más alto, y se muestra al usuario con el traceback completo (no solo el mensaje), para poder diagnosticar en qué paso exacto falló.
 
 ---
 
-## 3. Diagrama de flujo en texto
+## 3. Diagrama de flujo (mermaid)
 
+```mermaid
+flowchart TD
+    A(["Usuario carga video viejo, video nuevo, subtítulo y presiona 'Sincronizar'"]) --> B{"¿Campos completos, archivos válidos y carpeta de salida existente?"}
+    B -->|No| ERR0["⚠️ Advertencia con el campo inválido específico"]
+    B -->|Sí| C["Extraer audio de ambos videos (ffmpeg → WAV mono 16kHz)"]
+    C -->|"ffmpeg falla"| ERRA["Error con el motivo real (últimas líneas de stderr)"]
+    C --> D["Calcular features: mel-spectrogram (0.3) + onset strength (0.7), sin chroma"]
+    D --> E["Ventanas deslizantes de 30s (paso 10s): correlación FFT contra el audio nuevo (±300s), confianza por desviación estándar"]
+    E --> F["Agrupar ventanas fiables (confianza ≥ 3.0) en segmentos"]
+    F --> G{"¿Salto de offset > 1.0s o hueco temporal > 20.0s? (por cada ventana consecutiva)"}
+    G -->|Sí| G1["Cerrar segmento actual, abrir uno nuevo"]
+    G -->|No| G2["Acumular ventana en el segmento actual (offset ponderado por confianza)"]
+    G1 --> H
+    G2 --> H
+    H{"¿Hay al menos un segmento? (sin ninguna ventana fiable, se usa la de mayor confianza como segmento único)"}
+    H -->|No, ninguna ventana en absoluto| ERRB["Error: 'No se encontraron segmentos fiables'"]
+    H -->|Sí| I["Aplicar el offset del segmento correspondiente a cada línea según su inicio (margen ±5s); guardar tiempos originales pre-offset"]
+
+    I --> J["Resolver keyframes (se repite igual para video viejo y video nuevo)"]
+    J --> K{"¿El usuario cargó un archivo de keyframes para este video?"}
+    K -->|Sí| L["Parsear archivo (formato Aegisub/wwxd/scxvid/vstools o XviD 2pass)"]
+    L --> M["Intentar timestamps reales de frame vía VapourSynth (lsmas o ffms2, subproceso aislado)"]
+    M -->|Éxito| N["Convertir números de frame a ms con timestamps reales; borrar el índice .lwi/.ffindex generado en esta corrida"]
+    M -->|"VapourSynth falla"| O["Log: 'VapourSynth falló, cayendo a detección automática'"]
+    K -->|No| P["Extraer keyframes automáticamente vía ffprobe (frames tipo I)"]
+    O --> P
+    N --> Q
+    P --> Q
+
+    Q{"¿Ambos videos produjeron al menos un keyframe?"}
+    Q -->|No| R["Log: 'Sin keyframes disponibles, snap omitido'"]
+    Q -->|Sí| S{"¿Hay timestamps reales de frame del video nuevo?"}
+    S -->|No| S1["Fallback de duración de frame por fps real del video nuevo (ffprobe), o ~42ms si no se pudo determinar"]
+    S -->|Sí| T
+    S1 --> T["Detectar pares de líneas 'pegadas' (end de una y start de otra ancladas al mismo keyframe viejo)"]
+    T --> U["Para cada línea: si start/end original estaba a ≤170ms de un keyframe viejo, buscar el más cercano en el video nuevo"]
+    U --> U1{"¿Ese end está 'pegado' al start de otra línea?"}
+    U1 -->|Sí| U2["end = mismo valor que tendría un start"]
+    U1 -->|No| U3["end = frame inmediatamente anterior al keyframe (convención de end exclusivo)"]
+    U2 --> V
+    U3 --> V
+    R --> V
+
+    V["Actualizar Video File / Audio File del subtítulo al video nuevo"]
+    V --> W["Guardar subtítulo sincronizado"]
+    W --> X(["Mostrar éxito al usuario"])
 ```
-┌─────────────────────────────────────────────────────┐
-│                    SINCRONYAA                       │
-│              Inicio del proceso                     │
-└──────────────────────┬──────────────────────────────┘
-                       │
-           ┌───────────▼───────────┐
-           │   Extraer audio       │
-           │  ffmpeg → WAV mono    │
-           │  16kHz, ambos videos  │
-           └───────────┬───────────┘
-                       │
-           ┌───────────▼───────────┐
-           │  Calcular features    │
-           │  ┌─────────────────┐  │
-           │  │ mel-spectrogram │  │  → energía espectral
-           │  │ chroma          │  │  → información tonal
-           │  │ onset strength  │  │  → ataques sonoros
-           │  └────────┬────────┘  │
-           │     normalizar        │
-           │     ponderar y        │
-           │     combinar          │
-           └───────────┬───────────┘
-                       │
-           ┌───────────▼───────────┐
-           │  Correlación cruzada  │
-           │       FFT             │
-           │                       │
-           │  feat_ant ──┐         │
-           │  feat_nue ──┼→ corr   │
-           │             │         │
-           │  top 5 picos          │  → 5 offsets candidatos
-           │  (no máx supresión)   │    separados entre sí
-           └───────────┬───────────┘
-                       │
-           ┌───────────▼───────────┐
-           │  Detectar escenas     │
-           │  ffmpeg scene filter  │
-           │  umbral = 0.35        │
-           │  filtrar gap < 1.0s   │
-           └───────────┬───────────┘
-                       │
-           ┌───────────▼───────────┐
-           │   Votar offset final  │
-           │                       │
-           │  Para cada candidato: │
-           │    medir distancia    │
-           │    a escenas nuevas   │
-           │                       │
-           │  ┌──────────────────┐ │
-           │  │ mejor alineación │ │  → offset_final
-           │  └──────────────────┘ │
-           └───────────┬───────────┘
-                       │
-           ┌───────────▼───────────┐
-           │  Aplicar al subtítulo │
-           │                       │
-           │  Para cada línea:     │
-           │    start += offset    │
-           │                       │
-           │    ¿cerca de escena?  │
-           │    ┌────────────────┐ │
-           │    │ Sí → ajuste    │ │  → atracción suave
-           │    │     suave      │ │     al corte (50%)
-           │    │ No → sin extra │ │
-           │    └────────────────┘ │
-           └───────────┬───────────┘
-                       │
-           ┌───────────▼───────────┐
-           │   Guardar subtítulo   │
-           │   sincronizado (.ass  │
-           │   o .srt)             │
-           └───────────────────────┘
-```
+
+(En cualquier punto del proceso, cancelar o un error irrecuperable cortan el flujo — no representados en el diagrama para no saturarlo; ver la nota de cancelación cooperativa en la sección 2.)
