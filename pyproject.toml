@@ -1,0 +1,55 @@
+# ─────────────────────────────────────────────────────────────
+#  SincroNyaa
+# ─────────────────────────────────────────────────────────────
+#
+# NOTA sobre el extra opcional [vapoursynth]:
+#   `pip install .[vapoursynth]` instala el paquete `vapoursynth` de
+#   PyPI. Desde la versión R74 de VapourSynth ese paquete incluye
+#   también el core (no es solo un binding delgado como en versiones
+#   anteriores), pero hace falta correr `vapoursynth config` por
+#   separado después de instalarlo para terminar de configurarlo.
+#
+#   Este extra NO instala los plugins de source filter que SincroNyaa
+#   necesita para leer timestamps reales de frame (lsmas / L-SMASH-Works
+#   y ffms2) — esos no se distribuyen por pip. Se instalan aparte vía
+#   VSRepo (`pip install vsrepo`, luego `vsrepo install lsmas ffms2`) o
+#   manualmente. Ver la sección de instalación del README.md para más
+#   detalle.
+#
+#   Sin VapourSynth + lsmas/ffms2, SincroNyaa funciona igual: el snap a
+#   keyframes cae automáticamente a detección por ffprobe (sin
+#   timestamps reales de frame). VapourSynth solo mejora la precisión
+#   en videos con fps variable (IVTC/decimation).
+
+[project]
+name = "sincronyaa"
+version = "0.2.0"
+description = "Resincroniza subtítulos .ass/.srt de un video viejo a un video nuevo, usando análisis de audio y snap a keyframes."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [
+    { name = "CiferrC" },
+]
+# Piso real fijado por scipy>=1.17.1 (requires_python ">=3.11" en PyPI,
+# confirmado contra la API de PyPI, no asumido). El resto de las
+# dependencias directas acepta pisos de Python más bajos.
+requires-python = ">=3.11"
+dependencies = [
+    "PyQt6>=6.10.2",
+    "librosa>=0.11.0",
+    "scipy>=1.17.1",
+    "numpy>=2.2.6",
+    "pysubs2>=1.8.0",
+]
+
+[project.optional-dependencies]
+vapoursynth = [
+    "vapoursynth",
+]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["sincronyaa"]

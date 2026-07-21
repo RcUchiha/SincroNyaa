@@ -12,14 +12,36 @@
 
 ### Requisitos del sistema
 
-- Python 3.10 o superior
+- Python 3.11 o superior (el piso real lo fija `scipy`, que desde la 1.17.1 requiere `>=3.11` — confirmado contra PyPI, no asumido)
 - [ffmpeg](https://ffmpeg.org/download.html) instalado y disponible en el PATH del sistema
 
 ### Dependencias de Python
 
+Las dependencias están declaradas en [`pyproject.toml`](pyproject.toml):
+
 ```bash
-pip install PyQt6 librosa pysubs2 scipy numpy
+pip install .
 ```
+
+### Dependencia opcional: VapourSynth (más precisión en el snap a keyframes)
+
+SincroNyaa puede usar [VapourSynth](https://www.vapoursynth.com/) para leer los timestamps reales de cada frame del video, en vez de asumir un framerate constante. Esto importa sobre todo en videos con fps variable (por ejemplo, contenido con IVTC/decimation aplicado), donde asumir un fps fijo puede desviar ligeramente el punto exacto de anclaje al hacer snap a keyframes.
+
+**Si no la instalás, no pasa nada**: SincroNyaa cae automáticamente a detección de keyframes por `ffprobe` (sin timestamps reales de frame). Es un fallback silencioso esperado, no un bug — el programa funciona igual, solo con un poco menos de precisión en ese paso puntual.
+
+Si la querés instalar:
+
+```bash
+pip install .[vapoursynth]
+```
+
+Esto instala el paquete `vapoursynth` de PyPI (que desde la versión R74 de VapourSynth incluye el core, no solo un binding). Hace falta un paso extra después, fuera de pip:
+
+```bash
+vapoursynth config
+```
+
+Además, este extra **no instala los plugins de source filter** que SincroNyaa necesita (`lsmas`/L-SMASH-Works y `ffms2`) — esos no se distribuyen por pip. Se instalan aparte con [VSRepo](https://www.vapoursynth.com/doc/installation.html) (`pip install vsrepo`, luego `vsrepo install lsmas ffms2`) o manualmente. Ver la [documentación oficial de instalación de VapourSynth](https://www.vapoursynth.com/doc/installation.html) para el detalle completo.
 
 ### Ejecutar
 
