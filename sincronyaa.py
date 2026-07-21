@@ -1190,6 +1190,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("SincroNyaa")
         self.setMinimumSize(700, 660)
         self.worker: SyncWorker | None = None
+        self._ultimo_valor_autosugerido: str = ""
         self._build_ui()
         self.setStyleSheet(STYLE)
         self._check_ffmpeg()
@@ -1261,8 +1262,9 @@ class MainWindow(QMainWindow):
             optional=True,
         )
 
-        # Auto-sugerir output al elegir subtítulo de entrada
-        self.row_subs.entry.textChanged.connect(self._suggest_output)
+        # Auto-sugerir output a partir del subtítulo y la carpeta del video nuevo
+        self.row_subs.entry.textChanged.connect(self._update_output_suggestion)
+        self.row_new.entry.textChanged.connect(self._update_output_suggestion)
 
         for row in (self.row_old, self.row_new, self.row_subs, self.row_output,
                     self.row_kf_old, self.row_kf_new):
@@ -1307,13 +1309,29 @@ class MainWindow(QMainWindow):
 
     # ── Helpers ──────────────────────────────────────────────────────────
 
-    def _suggest_output(self, sub_path: str):
-        """Rellena el campo de salida automáticamente si está vacío."""
-        if not sub_path or self.row_output.get():
+    def _update_output_suggestion(self):
+        """
+        Actualiza la sugerencia del campo de salida: nombre a partir del
+        subtítulo original, carpeta a partir del video nuevo.
+
+        No pisa un valor que el usuario haya escrito a mano. Se considera
+        que el usuario "no tocó" el campo si está vacío o si su valor
+        actual coincide con la última sugerencia que este método mismo
+        escribió ahí (self._ultimo_valor_autosugerido).
+        """
+        current = self.row_output.get()
+        if current and current != self._ultimo_valor_autosugerido:
+            return  # el usuario lo editó a mano, no lo pisamos
+
+        sub_path = self.row_subs.get()
+        new_video_path = self.row_new.get()
+        if not sub_path or not new_video_path:
             return
+
         p = Path(sub_path)
-        suggestion = str(p.with_name(p.stem + "_synced" + p.suffix))
+        suggestion = str(Path(new_video_path).parent / (p.stem + "_sincronyaa" + p.suffix))
         self.row_output.set(suggestion)
+        self._ultimo_valor_autosugerido = suggestion
 
     # ── Control del worker ───────────────────────────────────────────────
 
