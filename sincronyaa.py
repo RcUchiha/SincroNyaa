@@ -904,6 +904,10 @@ class SyncWorker(QThread):
                 else:
                     self.log.emit("   ↳ Sin keyframes disponibles, snap omitido.")
 
+                self.log.emit("🎯 Actualizando metadatos de video/audio en el subtítulo...")
+                subs.aegisub_project["Video File"] = self.new_video
+                subs.aegisub_project["Audio File"] = self.new_video
+
                 self.progress.emit(96)
                 subs.save(self.output_path)
                 if self._cancelled: return
