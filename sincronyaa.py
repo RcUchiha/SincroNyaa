@@ -907,6 +907,10 @@ class SyncWorker(QThread):
                 self.log.emit("🎯 Actualizando metadatos de video/audio en el subtítulo...")
                 subs.aegisub_project["Video File"] = self.new_video
                 subs.aegisub_project["Audio File"] = self.new_video
+                if self.kf_new_path:
+                    subs.aegisub_project["Keyframes File"] = self.kf_new_path
+                else:
+                    subs.aegisub_project.pop("Keyframes File", None)
 
                 self.progress.emit(96)
                 subs.save(self.output_path)
